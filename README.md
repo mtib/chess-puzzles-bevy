@@ -68,8 +68,9 @@ scripts/seed.py  one-off cache seeding from the Lichess puzzle database
 - Pieces: [caliente](https://github.com/avi-0/caliente) by avi-0, converted
   to PNG. No legal-move engine: the puzzle solutions come from Lichess's
   public puzzle database (CC0).
-- Inspired by the original QML version of this panel built for
-  [Omarchy](https://omarchy.org/).
+- The Quickshell/QML twin of this app — the same trainer as an Omarchy bar
+  panel:
+  **[mtib/chess-puzzles-qml](https://github.com/mtib/chess-puzzles-qml)**.
 
 ## License
 
