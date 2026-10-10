@@ -7,18 +7,37 @@ use crate::model::{Color, Kind};
 use crate::state::PanelState;
 use image::RgbaImage;
 
-pub const TEX: u32 = 512; // texture size: 8 cells of 64px
-pub const CELL: u32 = TEX / 8;
 
-pub const BG: [f32; 4] = [0x0e as f32 / 255.0, 0x0e as f32 / 255.0, 0x10 as f32 / 255.0, 1.0];
-pub const HATCH: [f32; 4] = [0x3c as f32 / 255.0, 0x3d as f32 / 255.0, 0x44 as f32 / 255.0, 1.0];
-pub const GRID: [f32; 4] = [0x45 as f32 / 255.0, 0x46 as f32 / 255.0, 0x4e as f32 / 255.0, 1.0];
-pub const MOVE: [f32; 4] = [0xe8 as f32 / 255.0, 0x89 as f32 / 255.0, 0x0c as f32 / 255.0, 1.0];
-pub const MOVE_FILL: [f32; 4] = [232.0 / 255.0, 138.0 / 255.0, 12.0 / 255.0, 0.42];
-pub const WRONG: [f32; 4] = [201.0 / 255.0, 79.0 / 255.0, 61.0 / 255.0, 0.55];
-pub const SELECTED: [f32; 4] = [232.0 / 255.0, 138.0 / 255.0, 12.0 / 255.0, 0.30];
-pub const USER_ARROW: [f32; 4] = [0xe6 as f32 / 255.0, 0xe6 as f32 / 255.0, 0xe6 as f32 / 255.0, 0.85];
-pub const USER_ARROW_PREVIEW: [f32; 4] = [0xe6 as f32 / 255.0, 0xe6 as f32 / 255.0, 0xe6 as f32 / 255.0, 0.60];
+// Terminal / neo-brutalist palette: pitch black base, coral primary accent.
+pub const BG: [f32; 4] = hex("#000000", 1.0); // pure black
+pub const HATCH: [f32; 4] = hex("#2a2a30", 1.0); // slate grey
+pub const GRID: [f32; 4] = hex("#3a3a42", 1.0); // subtle grey outline
+pub const MOVE: [f32; 4] = hex("#ff5232", 1.0); // coral
+pub const MOVE_FILL: [f32; 4] = [255.0 / 255.0, 82.0 / 255.0, 50.0 / 255.0, 0.40];
+pub const WRONG: [f32; 4] = [214.0 / 255.0, 69.0 / 255.0, 69.0 / 255.0, 0.55];
+pub const SELECTED: [f32; 4] = [255.0 / 255.0, 82.0 / 255.0, 50.0 / 255.0, 0.28];
+pub const USER_ARROW: [f32; 4] = hex("#c9cdd6", 0.85); // monochrome line art
+pub const USER_ARROW_PREVIEW: [f32; 4] = hex("#c9cdd6", 0.60);
+
+const fn nib(c: u8) -> u32 {
+    match c {
+        b'0'..=b'9' => (c - b'0') as u32,
+        b'a'..=b'f' => (c - b'a' + 10) as u32,
+        _ => 0,
+    }
+}
+
+const fn hex(hex: &str, a: f32) -> [f32; 4] {
+    let b = hex.as_bytes();
+    let n = (nib(b[1]) << 20) | (nib(b[2]) << 16) | (nib(b[3]) << 12) | (nib(b[4]) << 8)
+        | (nib(b[5]) << 4) | nib(b[6]);
+    [
+        ((n >> 16) & 0xff) as f32 / 255.0,
+        ((n >> 8) & 0xff) as f32 / 255.0,
+        (n & 0xff) as f32 / 255.0,
+        a,
+    ]
+}
 
 /// A pixel canvas: RGBA8, float colors, alpha blending.
 struct Px {
@@ -106,46 +125,63 @@ impl Px {
     }
 
     fn blit(&mut self, img: &RgbaImage, dx: f64, dy: f64, dw: f64, dh: f64) {
-        // Bilinear sampling of the source into the destination rect.
-        for yy in 0..dh.ceil() as u32 {
+        // Area-averaged (box filter) sampling: each destination pixel averages
+        // the source pixels it covers. Crisp minification at any size, without
+        // the blur of bilinear downsampling.
+        let sw = img.width() as f64;
+        let sh = img.height() as f64;
+        let x_ratio = sw / dw;
+        let y_ratio = sh / dh;
+        for yy in 0..dw.ceil().max(dh.ceil()) as u32 {
+            if yy >= dh.ceil() as u32 {
+                break;
+            }
             for xx in 0..dw.ceil() as u32 {
-                let sx = (xx as f64 / dw * img.width() as f64).min(img.width() as f64 - 1.0);
-                let sy = (yy as f64 / dh * img.height() as f64).min(img.height() as f64 - 1.0);
-                let sx0 = sx.floor() as u32;
-                let sy0 = sy.floor() as u32;
-                let fx = sx - sx0 as f64;
-                let fy = sy - sy0 as f64;
-                let mut acc = [0.0f32; 4];
-                for (ox, oy, wgt) in
-                    [(0u32, 0u32, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)), (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)]
-                {
-                    let sxn = (sx0 + ox).min(img.width() - 1);
-                    let syn = (sy0 + oy).min(img.height() - 1);
-                    let p = img.get_pixel(sxn, syn);
-                    for k in 0..4 {
-                        acc[k] += p[k] as f32 / 255.0 * wgt as f32;
+                let sx0 = xx as f64 * x_ratio;
+                let sy0 = yy as f64 * y_ratio;
+                let sx1 = (sx0 + x_ratio).ceil().min(sw);
+                let sy1 = (sy0 + y_ratio).ceil().min(sh);
+                let mut acc = [0.0f64; 4];
+                let mut n = 0.0;
+                let mut sy = sy0.floor();
+                while (sy as f64) < sy1 {
+                    let mut sx = sx0.floor();
+                    while (sx as f64) < sx1 {
+                        let p = img.get_pixel((sx as u32).min(img.width() - 1), (sy as u32).min(img.height() - 1));
+                        for k in 0..4 {
+                            acc[k] += p[k] as f64 / 255.0;
+                        }
+                        n += 1.0;
+                        sx += 1.0;
                     }
+                    sy += 1.0;
                 }
-                if acc[3] <= 0.0 {
-                    continue;
+                if n > 0.0 && acc[3] / n > 0.0 {
+                    self.blend(
+                        (dx + xx as f64) as i64,
+                        (dy + yy as f64) as i64,
+                        [(acc[0] / n) as f32, (acc[1] / n) as f32, (acc[2] / n) as f32, (acc[3] / n) as f32],
+                    );
                 }
-                self.blend(
-                    (dx + xx as f64) as i64,
-                    (dy + yy as f64) as i64,
-                    [acc[0], acc[1], acc[2], acc[3]],
-                );
             }
         }
     }
 }
 
 /// Paint the full board texture for the current state.
-pub fn paint_board(state: &PanelState, pieces: &std::collections::HashMap<String, RgbaImage>) -> Vec<u8> {
-    let mut px = Px::new(TEX, TEX);
-    px.fill_rect(0.0, 0.0, TEX as f64, TEX as f64, BG);
+/// Paint the full board texture for the current state at a given cell size
+/// (the texture is 8x cell, 1:1 with the on-screen board).
+pub fn paint_board(
+    state: &PanelState,
+    pieces: &std::collections::HashMap<String, RgbaImage>,
+    cell: u32,
+) -> Vec<u8> {
+    let tex = cell * 8;
+    let cell = cell as f64;
+    let mut px = Px::new(tex, tex);
+    px.fill_rect(0.0, 0.0, tex as f64, tex as f64, BG);
 
-    let cell = CELL as f64;
-
+    
     // Screen position of a board index, honoring orientation: the side to
     // move (or the flipped view) sits at the bottom.
     let flip = state.user_color == Color::Black;
@@ -178,64 +214,35 @@ pub fn paint_board(state: &PanelState, pieces: &std::collections::HashMap<String
         }
     }
 
-    // Diagonal hatching on the light squares: clipped 45° lines.
+    // Diagonal hatching on the light squares: pixel-exact 45° stripes along
+    // x+y = const, one pixel every 5 — no line-drawing aliasing.
     for row in 0..8 {
         for file in 0..8 {
             if (row + file) % 2 != 0 {
                 continue;
             }
-            let x = file as f64 * cell;
-            let y = row as f64 * cell;
-            let step = cell / 9.0; // mirrors the QML 5px hatch at a 53px cell
-            let mut d = -cell;
-            while d < cell + cell {
-                // clip: only draw the segment inside the cell
-                let sx = x + d;
-                let ex = x + d + cell;
-                let sy = y + cell;
-                let ey = y;
-                // param clip to rect
-                let clip = |x0: f64, y0: f64, x1: f64, y1: f64| -> Option<(f64, f64, f64, f64)> {
-                    // line from (x0,y0) to (x1,y1); clip to rect x..x+cell, y..y+cell
-                    let dx = x1 - x0;
-                    let dy = y1 - y0;
-                    let mut t0 = 0.0f64;
-                    let mut t1 = 1.0f64;
-                    let edges = [
-                        (x - x0, dx, 0.0),
-                        (x + cell - x0, dx, 1.0),
-                        (y - y0, dy, 0.0),
-                        (y + cell - y0, dy, 1.0),
-                    ];
-                    for (dist, dir, side) in edges {
-                        if dir.abs() < 1e-9 {
-                            continue;
-                        }
-                        let t = dist / dir;
-                        if (dir > 0.0) == (side > 0.5) {
-                            t0 = t0.max(t);
-                        } else {
-                            t1 = t1.min(t);
-                        }
+            let x0 = file as u32 * cell as u32;
+            let y0 = row as u32 * cell as u32;
+            let spacing = ((cell as u32 * 5) / 54).max(2);
+            for yy in 0..cell as u32 {
+                for xx in 0..cell as u32 {
+                    if ((x0 + xx + y0 + yy) % spacing) == 0 {
+                        px.blend((x0 + xx) as i64, (y0 + yy) as i64, HATCH);
                     }
-                    if t0 >= t1 {
-                        return None;
-                    }
-                    Some((x0 + dx * t0, y0 + dy * t0, x0 + dx * t1, y0 + dy * t1))
-                };
-                if let Some((a, b, c, d2)) = clip(sx, sy, ex, ey) {
-                    px.line(a, b, c, d2, 1.0, HATCH);
                 }
-                d += step;
             }
         }
     }
 
     // Dashed cell outlines over everything.
+    let tex_f = tex as f64;
+    let dash_on = cell * 4.8 / 54.0;
+    let dash_off = cell * 3.6 / 54.0;
     for g in 0..=8 {
-        let p = g as f64 * cell;
-        px.dashed_line(p, 0.0, p, TEX as f64, 4.8, 3.6, GRID);
-        px.dashed_line(0.0, p, TEX as f64, p, 4.8, 3.6, GRID);
+        // Clamp to tex-1: a line drawn exactly at the edge is clipped out.
+        let p = (g as f64 * cell).min(tex_f - 1.0);
+        px.dashed_line(p, 0.0, p, tex_f, dash_on, dash_off, GRID);
+        px.dashed_line(0.0, p, tex_f, p, dash_on, dash_off, GRID);
     }
 
     // Arrows: user-drawn (shift+drag), the live preview, then the automatic
@@ -314,3 +321,33 @@ pub fn paint_board(state: &PanelState, pieces: &std::collections::HashMap<String
     px.data
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::PanelState;
+
+    fn png_bytes(data: &[u8]) -> Vec<u8> {
+        // minimal: count pixel colors instead of encoding
+        data.to_vec()
+    }
+
+    #[test]
+    fn hatch_light_squares() {
+        let mut state = PanelState::new();
+        let (board, turn) = crate::model::parse_fen("6k1/2Q1R3/3p2p1/2p3N1/2bbP3/5P2/r5P1/4K3 b - - 1 1");
+        state.board = board;
+        state.user_color = turn;
+        state.phase = crate::state::Phase::Play;
+        let pieces = std::collections::HashMap::new();
+        let data = png_bytes(&paint_board(&state, &pieces, 54));
+        // count hatch-colored pixels (#3c3d44)
+        let mut hatch = 0;
+        for px in data.chunks(4) {
+            if px[0] == 0x2a && px[1] == 0x2a && px[2] == 0x30 {
+                hatch += 1;
+            }
+        }
+        assert!(hatch > 1000, "expected thousands of hatch pixels, got {hatch}");
+    }
+}

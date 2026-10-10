@@ -11,7 +11,22 @@ pub const ELO_MIN: i64 = 600;
 pub const ELO_MAX: i64 = 2500;
 pub const ELO_STEP: i64 = 50;
 const STATE_FILE: &str = ".local/state/omarchy/settings/chesspuzzles-bevy.json";
-const PICK_SH: &str = ".config/omarchy/plugins/mtib.chesspuzzles/pick.sh";
+/// Puzzle picker: override with $CHESS_PUZZLES_PICK; otherwise the repo's
+/// scripts/pick.sh (via CARGO_MANIFEST_DIR), then the Omarchy plugin copy.
+fn pick_script() -> PathBuf {
+    if let Ok(path) = std::env::var("CHESS_PUZZLES_PICK") {
+        return PathBuf::from(path);
+    }
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let local = PathBuf::from(manifest).join("scripts/pick.sh");
+        if local.exists() {
+            return local;
+        }
+    }
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".config/omarchy/plugins/mtib.chesspuzzles/pick.sh"))
+        .unwrap_or_else(|_| PathBuf::from("scripts/pick.sh"))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -96,7 +111,7 @@ impl PanelState {
         self.solved += 1;
         save_state(self);
         self.status = if self.tries == 0 {
-            "Solved! Clean solve 🎉".into()
+            "Solved! Clean solve".into()
         } else {
             format!(
                 "Solved! ({} wrong {})",
@@ -279,10 +294,7 @@ fn save_state(state: &PanelState) {
 }
 
 fn fetch_puzzle(target_elo: i64) -> Option<PuzzleRecord> {
-    let script = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(PICK_SH))
-        .unwrap_or_else(|_| PathBuf::from(PICK_SH));
-    let out = Command::new(&script).arg(target_elo.to_string()).output().ok()?;
+    let out = Command::new(pick_script()).arg(target_elo.to_string()).output().ok()?;
     if !out.status.success() {
         return None;
     }

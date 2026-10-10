@@ -1,33 +1,76 @@
 # chess-puzzles-bevy
 
-Native twin of the Omarchy `mtib.chesspuzzles` panel (Quickshell/QML), built
-with Rust + Bevy — for comparing the two implementations.
+Native chess puzzle trainer built with Rust + [Bevy](https://bevyengine.org)
+0.20: solve [Lichess](https://lichess.org) puzzles at a target ELO on a
+monochrome, terminal-styled board.
 
-Feature parity with the QML panel:
+![style: dark, developer-centric UI — pitch black, coral accent, monospaced HUD](https://img.shields.io/badge/style-pitch--black%20%7C%20coral%20%23FF5232-black)
 
-- Lichess puzzles served by the same `pick.sh` from the same shared local
-  cache (`~/.local/state/omarchy/chesspuzzles/cache.jsonl`), targeted at a
-  600–2500 ELO slider (step 50).
-- Click-click input, judged against the puzzle's solution list; opponent
-  replies auto-play after 650ms; "Show solution" walks the line at 650ms a
-  move; wrong attempts flash the target square; promotions accepted on the
-  first four characters.
-- Monochrome dark board painted on a CPU texture, mirroring the QML Canvas:
-  dark background, dashed cell outlines, diagonal-hatched light squares,
-  orange fill on the last move's squares, lighter orange selection, fading
-  move arrows, shift+drag user arrows (cleared by clicking an empty square).
-- Board flips so the side to move sits at the bottom.
-- Solved count + target ELO persist (separate state file from the QML panel:
-  `~/.local/state/omarchy/settings/chesspuzzles-bevy.json`).
-- Black knight as the logo (window icon + header).
+## Features
 
-Run:
+- **ELO slider** (600–2500, step 50): puzzles are served from a local cache,
+  picking the one closest to your target rating while avoiding the ~80 most
+  recently served.
+- **Offline cache** seeded from the
+  [Lichess puzzle database](https://database.lichess.org/) — popular puzzles
+  bucketed across the whole rating range. `pick.sh` falls back to a live
+  Lichess fetch and appends to the cache, so it grows on its own.
+- **Click-click input**, judged against the puzzle's solution list (no move
+  generator — the solution is the only judge). Opponent replies auto-play
+  after 650ms; "Show solution" walks the line at 650ms a move; wrong attempts
+  flash the target square; promotions accepted on the first four characters.
+- **Monochrome dark board**, CPU-painted to a texture (HiDPI-aware — painted
+  at the display's scale factor): pure black background, diagonal-hatched
+  light squares, dashed cell outlines, coral `#FF5232` for moved/selected
+  squares and move arrows, monochrome user-drawn arrows
+  (**shift+drag**), cleared by clicking an empty square.
+- **Responsive**: the board, cursor mapping, and slider all derive from the
+  live window size — any window size just works.
+- Board flips so the side to move sits at the bottom. Keyboard: `n` new
+  puzzle, `s` show solution, `f` flip board.
+
+## Run
 
 ```sh
 cargo run --release
 ```
 
-Keyboard: `n` new puzzle, `s` show solution, `f` flip board.
+Optional assets: piece art ships in `assets/pieces/` (see credits). A font is
+expected at `assets/fonts/`; any TTF works — e.g. JetBrains Mono:
 
-Piece art: [caliente](https://github.com/avi-0/caliente) by avi-0
-(converted from SVG to PNG in `assets/pieces/`).
+```sh
+mkdir -p assets/fonts
+cp /usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf assets/fonts/
+```
+
+The puzzle cache and state live under `~/.local/state/omarchy/`
+(`chesspuzzles/cache.jsonl`, `settings/chesspuzzles-bevy.json`). Point
+`CHESS_PUZZLES_PICK` at your own picker script to change where puzzles come
+from; it just needs to print one JSON record per invocation:
+
+```json
+{"id":"…","fen":"…","rating":2205,"themes":[…],"solution":["h5h7",…]}
+```
+
+## Layout
+
+```
+src/main.rs    Bevy app: window, UI, input, timers, board placement
+src/state.rs   puzzle state machine, persistence, puzzle fetching
+src/model.rs   FEN parsing + UCI move application (castling, EP, promotion)
+src/paint.rs   CPU board painter (hatch, dashes, arrows, piece blitting)
+scripts/pick.sh  serve one puzzle near a target ELO from the cache
+scripts/seed.py  one-off cache seeding from the Lichess puzzle database
+```
+
+## Credits
+
+- Pieces: [caliente](https://github.com/avi-0/caliente) by avi-0, converted
+  to PNG. No legal-move engine: the puzzle solutions come from Lichess's
+  public puzzle database (CC0).
+- Inspired by the original QML version of this panel built for
+  [Omarchy](https://omarchy.org/).
+
+## License
+
+MIT
