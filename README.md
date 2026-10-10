@@ -4,7 +4,7 @@ Native chess puzzle trainer built with Rust + [Bevy](https://bevyengine.org)
 0.20: solve [Lichess](https://lichess.org) puzzles at a target ELO on a
 monochrome, terminal-styled board.
 
-![style: dark, developer-centric UI — pitch black, coral accent, monospaced HUD](https://img.shields.io/badge/style-pitch--black%20%7C%20coral%20%23FF5232-black)
+![Chess Puzzles: monochrome terminal-styled board, coral move highlights](docs/screenshot.png)
 
 ## Features
 
