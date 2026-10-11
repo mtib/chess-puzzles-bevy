@@ -130,14 +130,11 @@ pub fn apply_uci(board: &Board, uci: &str) -> Board {
     next
 }
 
-/// A puzzle record, as emitted by pick.sh (flat JSON).
+/// A puzzle record, as emitted by pick.sh (flat JSON). Only the position
+/// and the solution are used; other fields (id, rating, themes) are ignored.
 #[derive(Clone, Debug, Deserialize)]
 pub struct PuzzleRecord {
-    pub id: String,
     pub fen: String,
-    pub rating: i64,
-    #[serde(default)]
-    pub themes: Vec<String>,
     pub solution: Vec<String>,
 }
 

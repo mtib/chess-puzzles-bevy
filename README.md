@@ -11,9 +11,9 @@ monochrome, terminal-styled board.
 - **Adaptive difficulty**: a hidden target ELO (600–2500) follows your
   results. Each puzzle settles once: a clean solve +8, a solve with wrong
   tries −4, showing the solution or skipping mid-puzzle −12. It settles where
-  you solve about two in three puzzles cleanly. A puzzle's rating is shown
-  only after it's settled. Puzzles are served from a local cache, picking the
-  one closest to the target while avoiding the ~80 most recently served.
+  you solve about two in three puzzles cleanly. Puzzles are served from a
+  local cache, picking the one closest to the target while avoiding the ~80
+  most recently served.
 - **Offline cache** seeded from the
   [Lichess puzzle database](https://database.lichess.org/) — popular puzzles
   bucketed across the whole rating range. `pick.sh` falls back to a live

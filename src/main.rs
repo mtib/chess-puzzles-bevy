@@ -23,7 +23,7 @@ use bevy::winit::{UpdateMode, WinitSettings};
 use model::PuzzleRecord;
 use paint::{paint_board, piece_size, BoardView};
 use pieces::{PieceArt, PieceSprites};
-use state::{PanelState, Phase, Tone};
+use state::{PanelState, Tone};
 use std::time::{Duration, Instant};
 use theme::ui;
 
@@ -36,8 +36,9 @@ const FLOOR_CELL: f32 = 4.0;
 /// Logical px kept free around the board inside its slot.
 const BOARD_MARGIN: f32 = 8.0;
 /// Logical height of everything around the board (title, status, buttons,
-/// padding, board margins): about 218 px measured at 1.6x, plus slack.
-const CONTROLS_H: f32 = 240.0;
+/// padding, board margins): about 200 px (218 measured at 1.6x, less the
+/// removed meta line), plus slack.
+const CONTROLS_H: f32 = 220.0;
 /// Selection ring width, logical px.
 const RING: f32 = 2.0;
 /// Longest timer step per frame. The first frame after an idle wait reports
@@ -87,8 +88,6 @@ struct BoardSlot;
 struct BoardSprite;
 #[derive(Component)]
 struct StatusText;
-#[derive(Component)]
-struct MetaText;
 #[derive(Component)]
 struct SolvedText;
 
@@ -202,13 +201,8 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, asset_server
             ));
 
             col.spawn((text(&font, "", 14.0, FontWeight::NORMAL, theme::TEXT), LetterSpacing::Px(0.0), StatusText));
-            col.spawn((
-                text(&font, "", 11.0, FontWeight::NORMAL, theme::MUTED),
-                MetaText,
-                Node { margin: UiRect::vertical(Val::Px(4.0)), ..default() },
-            ));
 
-            col.spawn(Node { column_gap: Val::Px(8.0), margin: UiRect::top(Val::Px(8.0)), ..default() })
+            col.spawn(Node { column_gap: Val::Px(8.0), margin: UiRect::top(Val::Px(12.0)), ..default() })
                 .with_children(|row| {
                     spawn_button(row, &font, "SHOW SOLUTION", Action::ShowSolution);
                     spawn_button(row, &font, "NEW PUZZLE", Action::NewPuzzle);
@@ -477,8 +471,7 @@ fn set_text(mut text: Mut<Text>, value: String) {
 fn update_ui(
     panel: Res<PanelRes>,
     mut status: Query<(&mut Text, &mut TextColor, &mut TextFont), With<StatusText>>,
-    mut meta: Query<&mut Text, (With<MetaText>, Without<StatusText>)>,
-    mut solved_text: Query<&mut Text, (With<SolvedText>, Without<StatusText>, Without<MetaText>)>,
+    mut solved_text: Query<&mut Text, (With<SolvedText>, Without<StatusText>)>,
 ) {
     let s = &panel.0;
     if let Ok((text, mut color, mut font)) = status.single_mut() {
@@ -494,21 +487,6 @@ fn update_ui(
             font.weight = weight;
         }
     }
-    if let Ok(text) = meta.single_mut() {
-        // The puzzle's rating would give the hidden target away: it shows
-        // only once the puzzle is settled.
-        let line = match (&s.puzzle, s.phase) {
-            (Some(p), phase) if phase != Phase::Loading => {
-                let mut parts = vec![format!("#{}", p.id)];
-                parts.extend(s.change.map(|_| p.rating.to_string()));
-                parts.extend(p.themes.first().cloned());
-                parts.join(" · ")
-            }
-            _ => String::new(),
-        };
-        set_text(text, line);
-    }
-
     if let Ok(text) = solved_text.single_mut() {
         set_text(text, format!("{} SOLVED", s.solved));
     }
