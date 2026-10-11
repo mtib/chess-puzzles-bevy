@@ -36,6 +36,13 @@ pub fn square_to_index(square: &str) -> usize {
     ((8 - rank) * 8 + file) as usize
 }
 
+/// Board index shown at screen (row, col), row 0 at the top. Flipping turns
+/// the board 180°, so the mapping is its own inverse: it also gives the
+/// screen cell of a board index.
+pub fn square_at(row: usize, col: usize, flipped: bool) -> usize {
+    if flipped { (7 - row) * 8 + (7 - col) } else { row * 8 + col }
+}
+
 pub fn index_to_square(index: usize) -> String {
     let file = b'a' + (index % 8) as u8;
     let rank = b'0' + (8 - index / 8) as u8;
@@ -105,8 +112,8 @@ pub fn apply_uci(board: &Board, uci: &str) -> Board {
             next[row * 8 + 5] = next[row * 8 + 7];
             next[row * 8 + 7] = None;
         } else {
-            next[row * 8 + 3] = next[row * 8 + 0];
-            next[row * 8 + 0] = None;
+            next[row * 8 + 3] = next[row * 8];
+            next[row * 8] = None;
         }
     }
 
@@ -136,7 +143,7 @@ pub struct PuzzleRecord {
 
 pub fn side_name(color: Color) -> &'static str {
     match color {
-        Color::White => "White",
-        Color::Black => "Black",
+        Color::White => "white",
+        Color::Black => "black",
     }
 }

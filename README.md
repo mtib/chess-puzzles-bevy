@@ -4,7 +4,7 @@ Native chess puzzle trainer built with Rust + [Bevy](https://bevyengine.org)
 0.20: solve [Lichess](https://lichess.org) puzzles at a target ELO on a
 monochrome, terminal-styled board.
 
-![Chess Puzzles: monochrome terminal-styled board, coral move highlights](docs/screenshot.png)
+![chess puzzles: black board with hatched light squares, dashed outlines and an orange primary button](docs/screenshot.png)
 
 ## Features
 
@@ -19,13 +19,16 @@ monochrome, terminal-styled board.
   generator — the solution is the only judge). Opponent replies auto-play
   after 650ms; "Show solution" walks the line at 650ms a move; wrong attempts
   flash the target square; promotions accepted on the first four characters.
-- **Monochrome dark board**, CPU-painted to a texture (HiDPI-aware — painted
-  at the display's scale factor): pure black background, diagonal-hatched
-  light squares, dashed cell outlines, coral `#FF5232` for moved/selected
-  squares and move arrows, monochrome user-drawn arrows
-  (**shift+drag**), cleared by clicking an empty square.
-- **Responsive**: the board, cursor mapping, and slider all derive from the
-  live window size — any window size just works.
+  Puzzles are fetched off the main thread, and the slider only fetches when
+  released.
+- **Pixel-exact board**, CPU-painted to a texture with one texel per physical
+  pixel at any window size and display scale: whole-pixel squares, 1px dashed
+  outlines, and pieces rendered from SVG at their exact size (no resampling).
+  Pure black, diagonal-hatched light squares, one accent (`#ff5a36`) for the
+  last move, selection ring, wrong attempts and move arrows; monochrome
+  user-drawn arrows (**shift+drag**), cleared by clicking an empty square.
+- **Low power**: event-driven. It renders only while something changes
+  (input, a countdown, a fade, a fetch) and otherwise sleeps.
 - Board flips so the side to move sits at the bottom. Keyboard: `n` new
   puzzle, `s` show solution, `f` flip board.
 
@@ -35,13 +38,8 @@ monochrome, terminal-styled board.
 cargo run --release
 ```
 
-Optional assets: piece art ships in `assets/pieces/` (see credits). A font is
-expected at `assets/fonts/`; any TTF works — e.g. JetBrains Mono:
-
-```sh
-mkdir -p assets/fonts
-cp /usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf assets/fonts/
-```
+Piece art (`assets/pieces/*.svg`) and the font (JetBrains Mono, variable
+weight) ship in `assets/`. `scripts/pick.sh` needs `curl` and `jq`.
 
 The puzzle cache and state live under `~/.local/state/omarchy/`
 (`chesspuzzles/cache.jsonl`, `settings/chesspuzzles-bevy.json`). Point
@@ -55,23 +53,29 @@ from; it just needs to print one JSON record per invocation:
 ## Layout
 
 ```
-src/main.rs    Bevy app: window, UI, input, timers, board placement
-src/state.rs   puzzle state machine, persistence, puzzle fetching
+src/main.rs    Bevy app: window, UI, input, async fetch, board placement, idle
+src/state.rs   puzzle state machine (phases own their countdowns), persistence
 src/model.rs   FEN parsing + UCI move application (castling, EP, promotion)
 src/paint.rs   CPU board painter (hatch, dashes, arrows, piece blitting)
+src/pieces.rs  SVG piece art, rasterized with resvg at the board's cell size
+src/theme.rs   colour tokens
+src/paths.rs   where assets/ and scripts/ are found
 scripts/pick.sh  serve one puzzle near a target ELO from the cache
 scripts/seed.py  one-off cache seeding from the Lichess puzzle database
 ```
 
 ## Credits
 
-- Pieces: [caliente](https://github.com/avi-0/caliente) by avi-0, converted
-  to PNG. No legal-move engine: the puzzle solutions come from Lichess's
-  public puzzle database (CC0).
+- Pieces: [caliente](https://github.com/avi-0/caliente) by avi-0
+  (CC BY-NC-SA 4.0), the SVGs as shipped by Lichess. No legal-move engine:
+  the puzzle solutions come from Lichess's public puzzle database (CC0).
+- Font: [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono)
+  (OFL 1.1, `assets/fonts/OFL.txt`).
 - The Quickshell/QML twin of this app — the same trainer as an Omarchy bar
   panel:
   **[mtib/chess-puzzles-qml](https://github.com/mtib/chess-puzzles-qml)**.
 
 ## License
 
-MIT
+MIT for the code; the bundled pieces and font keep their own licenses (see
+credits).

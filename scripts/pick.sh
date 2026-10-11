@@ -7,6 +7,8 @@
 # anonymous Lichess /api/puzzle/next endpoint and appends what it fetched, so
 # the cache grows on its own.
 #
+# Needs curl and jq.
+#
 # $1 = target ELO
 
 elo="$1"
@@ -18,17 +20,13 @@ recent="$dir/recent.txt"
 mkdir -p "$dir"
 touch "$cache" "$recent"
 
-# Online fallback + cache refill.
+# Online fallback + cache refill: one flat record, or failure.
 online_puzzle() {
-  out=$(curl -fsS --max-time 8 "https://lichess.org/api/puzzle/next" 2>/dev/null) || return 1
-  printf '%s' "$out" | jq -ce '[.puzzle |
-    select(.fen != null and .solution != null and (.solution | length) > 0)] |
-    .[0] // empty | {id: (.id|tostring), fen, rating: (.rating // 0),
-      themes: ((.themes // [])[:3]), solution}' >/dev/null 2>&1 || return 1
-  printf '%s\n' "$out" | jq -c '[.puzzle |
-    select(.fen != null and .solution != null and (.solution | length) > 0)][0] |
-    {id: (.id|tostring), fen, rating: (.rating // 0),
-     themes: ((.themes // [])[:3]), solution}'
+  curl -fsS --max-time 8 "https://lichess.org/api/puzzle/next" 2>/dev/null |
+    jq -ce '.puzzle
+      | select(.fen != null and (.solution // [] | length) > 0)
+      | {id: (.id|tostring), fen, rating: (.rating // 0),
+         themes: ((.themes // [])[:3]), solution}' 2>/dev/null
 }
 
 [ -s "$cache" ] || online_puzzle >>"$cache"
@@ -49,7 +47,7 @@ pick=$(jq -nc --arg elo "$elo" --rawfile recent "$recent" --rawfile cache "$cach
 [ -n "$pick" ] || exit 1
 
 # Record the served id so the next pick is a different puzzle.
-jq -r '.id' <<<"$pick" >>"$recent"
+printf '%s\n' "$pick" | jq -r '.id' >>"$recent"
 tail -n 80 "$recent" >"$recent.tmp" && mv "$recent.tmp" "$recent"
 
 printf '%s\n' "$pick"

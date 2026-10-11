@@ -2,165 +2,194 @@
 
 mod model;
 mod paint;
+mod paths;
+mod pieces;
 mod state;
+mod theme;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::ecs::relationship::RelatedSpawnerCommands;
+use bevy::image::{Image, ImageSampler};
+use bevy::input::keyboard::KeyboardInput;
+use bevy::input::mouse::MouseButtonInput;
 use bevy::prelude::*;
+use bevy::render::view::{DebandDither, Tonemapping};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::text::{FontSize, FontSource};
-use model::Color as Side;
-use paint::paint_board;
-use state::{PanelState, Phase, ELO_MAX, ELO_MIN, ELO_STEP};
+use bevy::tasks::{futures::check_ready, IoTaskPool, Task};
+use bevy::text::{FontSize, FontWeight, LetterSpacing};
+use bevy::ui::RelativeCursorPosition;
+use bevy::window::{CursorLeft, CursorMoved, WindowResized, WindowScaleFactorChanged};
+use bevy::winit::{UpdateMode, WinitSettings};
+use model::PuzzleRecord;
+use paint::{paint_board, piece_size, BoardView};
+use pieces::{PieceArt, PieceSprites};
+use state::{PanelState, Phase, Tone, ELO_MAX, ELO_MIN, ELO_STEP};
+use std::time::Duration;
+use theme::ui;
 
-use bevy::image::Image;
-use std::collections::HashMap;
-
-// All layout math is in LOGICAL pixels and derived from the ACTUAL window
-// size each frame, so the panel adjusts to any window size.
-// Chrome above the board: header (38) + ELO row (26) + slider track (26).
-const CHROME_H: f32 = 90.0;
-// Status line + buttons below the board.
-const BOTTOM_H: f32 = 72.0;
+/// Logical px per square, before the display scale. The board shrinks
+/// below MIN_CELL only when the window is forced smaller than its minimum
+/// size (tiling), so it never overlaps the controls.
+const MIN_CELL: f32 = 22.0;
+const MAX_CELL: f32 = 96.0;
+const FLOOR_CELL: f32 = 4.0;
+/// Logical px kept free around the board inside its slot.
+const BOARD_MARGIN: f32 = 8.0;
 const SLIDER_W: f32 = 330.0;
-const SLIDER_Y: f32 = 68.0 + 11.0; // track occupies y 68..90; center = 79
-const MIN_CELL: u32 = 22;
-const MAX_CELL: u32 = 96;
-
-/// Board geometry derived from the live window size and display scale.
-/// On HiDPI (retina) the texture is painted at `paint_cell` texels per square
-/// — cell * scale — while the sprite displays at logical `cell` px, so the
-/// pieces keep full physical-pixel detail instead of being upscaled.
-#[derive(Resource, Clone, Copy)]
-struct BoardLayout {
-    cell: u32,       // logical px per square
-    paint_cell: u32, // texels per square (cell * display scale factor)
-    x0: f32,         // board left edge (logical)
-    top: f32,        // board top edge (logical)
-    size: f32,       // board display size (logical, cell * 8)
-}
-
-impl BoardLayout {
-    fn compute(w: f32, h: f32, scale: f32) -> Self {
-        let avail_w = (w - 16.0).max(64.0);
-        let avail_h = (h - CHROME_H - BOTTOM_H - 16.0).max(64.0);
-        let cell = ((avail_w.min(avail_h) / 8.0).floor() as u32).clamp(MIN_CELL, MAX_CELL);
-        let size = cell as f32 * 8.0;
-        let x0 = ((w - size) / 2.0).max(0.0);
-        let top = CHROME_H + (h - BOTTOM_H - CHROME_H - size) / 2.0;
-        let paint_cell = ((cell as f32 * scale).round() as u32).max(cell);
-        BoardLayout { cell, paint_cell, x0, top, size }
-    }
-}
+/// Logical height of everything around the board (title, slider, status,
+/// buttons, padding): about 210 px in the running layout, plus slack.
+const CONTROLS_H: f32 = 260.0;
+/// Selection ring width, logical px.
+const RING: f32 = 2.0;
+/// Longest timer step per frame. The first frame after an idle wait reports
+/// the whole wait as its delta; unclamped, a reply scheduled by that frame's
+/// click would play instantly.
+const MAX_TICK_MS: f32 = 50.0;
+/// Frames rendered after the last input, so the pipelined renderer shows its
+/// result before the loop goes back to sleep.
+const TRAILING_FRAMES: u8 = 2;
+/// Wake-up interval while idle, as a safety net; input wakes it at once.
+const IDLE_WAKE: Duration = Duration::from_secs(60);
 
 #[derive(Resource)]
 struct PanelRes(PanelState);
 
-#[derive(Resource)]
-struct BoardImageHandle(Handle<Image>);
-
+/// The in-flight puzzle fetch, run on the IO pool so the window never blocks.
 #[derive(Resource, Default)]
-struct CurrentCell(u32);
-
-#[derive(Component)]
-struct BoardSprite;
+struct FetchJob(Option<Task<Option<PuzzleRecord>>>);
 
 #[derive(Resource)]
-struct PieceImages(HashMap<String, image::RgbaImage>);
+struct PieceSource(PieceArt);
 
-#[derive(Resource)]
-struct Cursor {
-    x: f32,
-    y: f32, // logical px, top-down
-    inside: bool,
+/// Where the board sits, in whole physical pixels: its top-left corner and
+/// the texels per square. The texture is exactly as big as the board on
+/// screen and starts on a pixel boundary, so every texel is one pixel.
+#[derive(Resource, Clone, Copy, PartialEq, Default)]
+struct BoardGeom {
+    cell: u32,
+    left: f32,
+    top: f32,
+    scale: f32,
 }
 
-impl Cursor {
-    fn new() -> Self {
-        Cursor { x: 0.0, y: 0.0, inside: false }
+impl BoardGeom {
+    fn texels(&self) -> u32 {
+        self.cell * 8
     }
 }
 
+/// The ELO the slider shows while being dragged; committed on release.
+#[derive(Resource, Default)]
+struct SliderDrag(Option<i64>);
+
+#[derive(Resource)]
+struct UiFont(Handle<Font>);
+
+#[derive(Component)]
+struct BoardSlot;
+#[derive(Component)]
+struct BoardSprite;
 #[derive(Component)]
 struct StatusText;
+#[derive(Component)]
+struct MetaText;
 #[derive(Component)]
 struct EloValueText;
 #[derive(Component)]
 struct SolvedText;
 #[derive(Component)]
+struct Slider;
+#[derive(Component)]
 struct SliderFill;
 #[derive(Component)]
 struct SliderKnob;
-#[derive(Component)]
-struct BtnNew;
-#[derive(Component)]
-struct BtnSolution;
+
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    NewPuzzle,
+    ShowSolution,
+}
+
+impl Action {
+    fn primary(self) -> bool {
+        self == Action::NewPuzzle
+    }
+}
+
+/// The button the mouse went down on; it fires if the mouse comes up on it.
+#[derive(Resource, Default)]
+struct ArmedButton(Option<Entity>);
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Chess Puzzles".into(),
-                resolution: (400u32, 560u32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .insert_resource(ClearColor(Color::srgb(0.0, 0.0, 0.0))) // pure black
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "chess puzzles".into(),
+                        resolution: (400u32, 600u32).into(),
+                        // Room for the controls plus a board of MIN_CELL squares.
+                        resize_constraints: WindowResizeConstraints {
+                            min_width: 8.0 * MIN_CELL + 2.0 * (16.0 + BOARD_MARGIN),
+                            min_height: 8.0 * MIN_CELL + CONTROLS_H,
+                            ..default()
+                        },
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(AssetPlugin { file_path: paths::assets_dir().to_string_lossy().into_owned(), ..default() }),
+        )
+        // Starts continuous; keep_awake drops to event-driven sleep once
+        // nothing changes.
+        .insert_resource(WinitSettings::continuous())
+        .insert_resource(ClearColor(ui(theme::BG)))
         .insert_resource(PanelRes(PanelState::new()))
-        .insert_resource(Cursor::new())
-        .add_systems(Startup, (setup, load_pieces, initial_fetch))
-        .add_systems(Update, position_board)
+        .insert_resource(PieceSource(PieceArt::load(&paths::assets_dir().join("pieces"))))
+        .init_resource::<FetchJob>()
+        .init_resource::<BoardGeom>()
+        .init_resource::<SliderDrag>()
+        .init_resource::<ArmedButton>()
+        .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
-                track_cursor,
+                layout_board,
+                drive_fetch,
                 board_input,
-                ui_interactions,
-                timers,
+                keyboard_input,
+                buttons,
+                slider,
+                tick,
                 update_ui,
                 repaint_board,
+                keep_awake,
             )
                 .chain(),
         )
         .run();
 }
 
-fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, asset_server: Res<AssetServer>, windows: Query<&Window>) {
-    commands.spawn(Camera2d);
+fn text(font: &UiFont, value: impl Into<String>, size: f32, weight: FontWeight, color: theme::Rgba) -> impl Bundle {
+    (
+        Text::new(value),
+        TextFont { font: font.0.clone().into(), font_size: FontSize::Px(size), weight, ..default() },
+        TextColor(ui(color)),
+    )
+}
 
-    // Board texture, created empty and repainted from PanelState at the
-    // window-derived cell size.
-    let (win_w, win_h, scale) = windows
-        .single()
-        .map(|w| (w.width(), w.height(), w.scale_factor()))
-        .unwrap_or((470.0, 640.0, 1.0));
-    let layout = BoardLayout::compute(win_w, win_h, scale);
-    let tex = layout.paint_cell * 8;
-    let initial = Image::new(
-        Extent3d { width: tex, height: tex, depth_or_array_layers: 1 },
-        TextureDimension::D2,
-        vec![0; (tex * tex * 4) as usize],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-    );
-    let handle = images.add(initial);
-    commands.insert_resource(BoardImageHandle(handle.clone()));
-    commands.insert_resource(CurrentCell(layout.paint_cell));
-    commands.insert_resource(layout);
+/// An UPPERCASE tracked label (labels, buttons, status words).
+fn label(font: &UiFont, value: &str, color: theme::Rgba) -> impl Bundle {
+    (text(font, value, 11.0, FontWeight::BOLD, color), LetterSpacing::Px(2.0))
+}
 
-    commands.spawn((
-        Sprite {
-            image: handle,
-            custom_size: Some(Vec2::splat(layout.size)),
-            ..default()
-        },
-        Transform::from_xyz(0.0, 0.0, 0.0),
-        BoardSprite,
-    ));
-
-    // ---- UI chrome
-    let font: Handle<Font> = asset_server.load("fonts/JetBrainsMonoNerdFont-Regular.ttf");
+fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, asset_server: Res<AssetServer>) {
+    // Flat colours stay exact: no tonemapping curve, no deband noise.
+    commands.spawn((Camera2d, Tonemapping::None, DebandDither::Disabled));
+    let font = UiFont(asset_server.load("fonts/JetBrainsMono-Variable.ttf"));
+    // A world sprite rather than a UI image: UI layout rounds edges from
+    // fractional positions, which can stretch the board by a pixel.
+    commands.spawn((Sprite::from_image(images.add(board_image(8))), BoardSprite));
 
     commands
         .spawn(Node {
@@ -168,451 +197,459 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, asset_server
             height: Val::Percent(100.0),
             flex_direction: FlexDirection::Column,
             align_items: AlignItems::Center,
+            padding: UiRect::axes(Val::Px(16.0), Val::Px(14.0)),
             ..default()
         })
         .with_children(|col| {
-            // Header: knight logo + title + solved count.
+            // Lowercase wordmark, solved count as a muted label beneath.
+            col.spawn((text(&font, "chess puzzles", 24.0, FontWeight::BOLD, theme::HEADING), LetterSpacing::Px(-1.2)));
+            col.spawn((label(&font, "", theme::MUTED), SolvedText, Node { margin: UiRect::top(Val::Px(4.0)), ..default() }));
+
+            // ELO: label + value, then the slider.
             col.spawn(Node {
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(8.0),
-                margin: UiRect::all(Val::Px(6.0)),
-                align_items: AlignItems::Center,
+                column_gap: Val::Px(10.0),
+                margin: UiRect::top(Val::Px(14.0)),
+                align_items: AlignItems::Baseline,
                 ..default()
             })
             .with_children(|row| {
-                row.spawn((
-                    Text::new("CHESS PUZZLES"),
-                    TextFont {
-                        font: FontSource::Handle(font.clone()),
-                        font_size: FontSize::Px(19.0),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.92, 0.92, 0.92)),
-                ));
-                row.spawn((
-                    Text::new(""),
-                    TextFont {
-                        font: FontSource::Handle(font.clone()),
-                        font_size: FontSize::Px(13.0),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.063, 0.72, 0.505)), // #10b981 electric green
-                    SolvedText,
-                ));
+                row.spawn(label(&font, "PUZZLE ELO", theme::MUTED));
+                row.spawn((text(&font, "", 13.0, FontWeight::BOLD, theme::TEXT), EloValueText));
             });
-
-            // ELO label + value.
-            col.spawn(Node {
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(8.0),
-                margin: UiRect::top(Val::Px(10.0)),
-                ..default()
-            })
-            .with_children(|row| {
-                row.spawn((
-                    Text::new("PUZZLE ELO"),
-                    TextFont {
-                        font: FontSource::Handle(font.clone()),
-                        font_size: FontSize::Px(13.0),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.54, 0.56, 0.60)), // dim grey
-                ));
-                row.spawn((
-                    Text::new("1500"),
-                    TextFont {
-                        font: FontSource::Handle(font.clone()),
-                        font_size: FontSize::Px(13.0),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.92, 0.92, 0.92)),
-                    EloValueText,
-                ));
-            });
-
-            // Slider track: base track + fill + knob, all absolutely
-            // positioned so they overlay the same 6px band.
-            col.spawn(Node {
-                width: Val::Px(SLIDER_W),
-                height: Val::Px(22.0),
-                margin: UiRect::top(Val::Px(4.0)),
-                ..default()
-            })
+            // The slider node is a 20px hit area; the 4px track sits centred in it.
+            col.spawn((
+                Node {
+                    width: Val::Px(SLIDER_W),
+                    max_width: Val::Percent(100.0),
+                    height: Val::Px(20.0),
+                    margin: UiRect::top(Val::Px(4.0)),
+                    ..default()
+                },
+                RelativeCursorPosition::default(),
+                Slider,
+            ))
             .with_children(|track| {
+                let bar = |width: Val| Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(8.0),
+                    width,
+                    height: Val::Px(4.0),
+                    ..default()
+                };
+                track.spawn((bar(Val::Percent(100.0)), BackgroundColor(ui(theme::LINE_STRONG))));
+                track.spawn((bar(Val::Percent(0.0)), BackgroundColor(ui(theme::TEXT)), SliderFill));
                 track.spawn((
                     Node {
                         position_type: PositionType::Absolute,
-                        top: Val::Px(8.0),
-                        left: Val::Px(0.0),
-                        width: Val::Percent(100.0),
-                        height: Val::Px(6.0),
+                        top: Val::Px(5.0),
+                        width: Val::Px(10.0),
+                        height: Val::Px(10.0),
                         ..default()
                     },
-                    BackgroundColor(Color::srgb(0.165, 0.165, 0.188)), // #2a2a30
-                ));
-                track.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        top: Val::Px(8.0),
-                        left: Val::Px(0.0),
-                        width: Val::Percent(0.0),
-                        height: Val::Px(6.0),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(1.0, 0.322, 0.196)), // coral #ff5232
-                    SliderFill,
-                ));
-                track.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        top: Val::Px(4.0),
-                        left: Val::Px(0.0),
-                        width: Val::Px(14.0),
-                        height: Val::Px(14.0),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.90, 0.91, 0.94)),
+                    BackgroundColor(ui(theme::INVERT)),
                     SliderKnob,
                 ));
             });
 
-            // Flexible spacer: the world-space board lives in this gap at
-            // any window size, with status + buttons anchored to the bottom.
-            col.spawn(Node { flex_grow: 1.0, ..default() });
-
-            // Status line.
+            // Free space for the board; layout_board places the sprite in it.
             col.spawn((
-                Node {
-                    margin: UiRect::new(Val::Px(0.0), Val::Px(0.0), Val::Px(6.0), Val::Px(6.0)),
-                    ..default()
-                },
-                Text::new(""),
-                TextFont {
-                    font: FontSource::Handle(font.clone()),
-                    font_size: FontSize::Px(14.0),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.92, 0.92, 0.92)),
-                StatusText,
+                Node { flex_grow: 1.0, width: Val::Percent(100.0), min_height: Val::Px(0.0), ..default() },
+                BoardSlot,
             ));
 
-            // Buttons.
-            col.spawn(Node {
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(10.0),
-                margin: UiRect::bottom(Val::Px(10.0)),
-                ..default()
-            })
-            .with_children(|row| {
-                spawn_button(row, font.clone(), "SHOW SOLUTION", BtnSolution);
-                spawn_button(row, font.clone(), "NEW PUZZLE", BtnNew);
-            });
+            col.spawn((text(&font, "", 14.0, FontWeight::NORMAL, theme::TEXT), LetterSpacing::Px(0.0), StatusText));
+            col.spawn((
+                text(&font, "", 11.0, FontWeight::NORMAL, theme::MUTED),
+                MetaText,
+                Node { margin: UiRect::vertical(Val::Px(4.0)), ..default() },
+            ));
+
+            col.spawn(Node { column_gap: Val::Px(8.0), margin: UiRect::top(Val::Px(8.0)), ..default() })
+                .with_children(|row| {
+                    spawn_button(row, &font, "SHOW SOLUTION", Action::ShowSolution);
+                    spawn_button(row, &font, "NEW PUZZLE", Action::NewPuzzle);
+                });
         });
+    commands.insert_resource(font);
 }
 
-fn spawn_button(parent: &mut RelatedSpawnerCommands<ChildOf>, font: Handle<Font>, label: &str, marker: impl Component) {
+fn spawn_button(parent: &mut RelatedSpawnerCommands<ChildOf>, font: &UiFont, value: &str, action: Action) {
     parent
         .spawn((
             Node {
-                padding: UiRect::axes(Val::Px(14.0), Val::Px(6.0)),
+                height: Val::Px(34.0),
+                padding: UiRect::horizontal(Val::Px(16.0)),
                 border: UiRect::all(Val::Px(1.0)),
+                align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.08, 0.08, 0.10)), // flat dark fill
-            BorderColor::all(Color::srgb(0.23, 0.23, 0.26)), // 1px grey outline
-            Interaction::default(),
-            marker,
+            BackgroundColor::default(),
+            BorderColor::default(),
+            RelativeCursorPosition::default(),
+            action,
         ))
         .with_children(|btn| {
-            btn.spawn((
-                Text::new(label.to_string()),
-                TextFont {
-                    font: FontSource::Handle(font),
-                    font_size: FontSize::Px(13.0),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.92, 0.92, 0.92)),
-            ));
+            btn.spawn(label(font, value, theme::TEXT));
         });
 }
 
-fn load_pieces(mut commands: Commands) {
-    // Piece PNGs are loaded straight off disk — the painter works on raw
-    // pixels, not on Bevy assets.
-    let mut map = HashMap::new();
-    for kind in ["p", "n", "b", "r", "q", "k"] {
-        for color in ["w", "b"] {
-            let name = format!("{kind}{color}");
-            if let Ok(img) = image::open(format!("assets/pieces/{name}.png")) {
-                map.insert(name, img.to_rgba8());
-            }
-        }
-    }
-    commands.insert_resource(PieceImages(map));
-}
-
-fn initial_fetch(mut panel: ResMut<PanelRes>) {
-    panel.0.fetch_puzzle();
+fn board_image(texels: u32) -> Image {
+    let mut image = Image::new(
+        Extent3d { width: texels, height: texels, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        vec![0; (texels * texels * 4) as usize],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    // Texels map 1:1 to physical pixels; never filter.
+    image.sampler = ImageSampler::nearest();
+    image
 }
 
 // ------------------------------------------------------------------ systems
 
-fn track_cursor(mut commands: Commands, mut cursor: ResMut<Cursor>, windows: Query<&Window>) {
-    let Ok(window) = windows.single() else { return };
-    if let Some(pos) = window.cursor_position() {
-        // cursor_position is logical and top-down relative to the window.
-        cursor.x = pos.x;
-        cursor.y = pos.y;
-        cursor.inside = true;
-    } else {
-        cursor.inside = false;
+/// Sizes and places the board in the free slot: whole physical pixels per
+/// square, top-left corner on a pixel boundary.
+fn layout_board(
+    windows: Query<&Window>,
+    slot: Query<(&ComputedNode, &UiGlobalTransform), With<BoardSlot>>,
+    mut sprite: Query<(&mut Transform, &mut Sprite), With<BoardSprite>>,
+    mut geom: ResMut<BoardGeom>,
+) {
+    let (Ok(window), Ok((slot, slot_at)), Ok((mut transform, mut sprite))) =
+        (windows.single(), slot.single(), sprite.single_mut())
+    else {
+        return;
+    };
+    let scale = window.scale_factor();
+    let avail = (slot.size() - Vec2::splat(2.0 * BOARD_MARGIN * scale)).min_element();
+    let cell = (avail / 8.0).floor().clamp(FLOOR_CELL * scale, MAX_CELL * scale) as u32;
+    let board = (cell * 8) as f32;
+    let corner = (slot_at.translation - board / 2.0).round();
+    geom.set_if_neq(BoardGeom { cell, left: corner.x, top: corner.y, scale });
+
+    // World space: origin at the window centre, y up, logical units.
+    let window_px = Vec2::new(window.physical_width() as f32, window.physical_height() as f32);
+    let centre = (corner + board / 2.0 - window_px / 2.0) / scale;
+    let translation = Vec3::new(centre.x, -centre.y, 0.0);
+    if transform.translation != translation {
+        transform.translation = translation;
     }
-    let layout = BoardLayout::compute(window.width(), window.height(), window.scale_factor());
-    commands.insert_resource(layout);
+    let size = Some(Vec2::splat(board / scale));
+    if sprite.custom_size != size {
+        sprite.custom_size = size;
+    }
 }
 
-fn board_cell_at(state: &PanelState, cursor: &Cursor, layout: &BoardLayout) -> Option<usize> {
-    if !cursor.inside {
-        return None;
+/// Starts requested fetches on the IO pool and hands results back.
+fn drive_fetch(mut panel: ResMut<PanelRes>, mut job: ResMut<FetchJob>) {
+    if let Some(task) = job.0.as_mut()
+        && let Some(record) = check_ready(task)
+    {
+        job.0 = None;
+        // A newer request (e.g. the ELO changed mid-fetch) supersedes this result.
+        if !panel.0.fetch_pending() {
+            panel.0.puzzle_loaded(record);
+        }
     }
-    let cell = layout.cell as f32;
-    let x = cursor.x - layout.x0;
-    let y = cursor.y - layout.top;
-    if x < 0.0 || y < 0.0 || x >= layout.size || y >= layout.size {
-        return None;
+    if job.0.is_none()
+        && let Some(elo) = panel.0.take_fetch_request()
+    {
+        job.0 = Some(IoTaskPool::get().spawn(async move { state::fetch_puzzle(elo) }));
     }
-    let col = (x / cell) as usize;
-    let row = (y / cell) as usize;
-    let flip = state.user_color == Side::Black || state.flip_view;
-    Some(if flip { (7 - row) * 8 + (7 - col) } else { row * 8 + col })
 }
 
 fn board_input(
     mut panel: ResMut<PanelRes>,
-    cursor: Res<Cursor>,
-    layout: Res<BoardLayout>,
+    windows: Query<&Window>,
+    geom: Res<BoardGeom>,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
 ) {
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    let cell = board_cell_at(&panel.0, &cursor, &layout);
+    let Ok(window) = windows.single() else { return };
+    let cell = window.physical_cursor_position().and_then(|p| {
+        let col = ((p.x - geom.left) / geom.cell as f32).floor();
+        let row = ((p.y - geom.top) / geom.cell as f32).floor();
+        ((0.0..8.0).contains(&col) && (0.0..8.0).contains(&row))
+            .then(|| model::square_at(row as usize, col as usize, panel.0.is_flipped()))
+    });
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
 
-    // Shift+drag arrow drawing; plain press plays / clears.
-    if mouse.just_pressed(MouseButton::Left) {
-        if let Some(idx) = cell {
-            if shift {
-                panel.0.drag_arrow = Some((idx, idx));
-                return;
-            }
+    // Shift+drag draws an arrow; a plain press plays / clears.
+    if mouse.just_pressed(MouseButton::Left)
+        && let Some(idx) = cell
+    {
+        if shift {
+            panel.0.begin_arrow(idx);
+        } else {
             panel.0.click_square(idx);
         }
     }
-    if let Some((from, _)) = panel.0.drag_arrow {
-        if mouse.pressed(MouseButton::Left) {
-            if let Some(idx) = cell {
-                panel.0.drag_arrow = Some((from, idx));
-            }
-        } else {
-            if let Some((from, to)) = panel.0.drag_arrow {
-                if from != to {
-                    panel.0.user_arrows.push((from, to));
-                }
-            }
-            panel.0.drag_arrow = None;
+    if panel.0.drag_arrow.is_some() {
+        if !mouse.pressed(MouseButton::Left) {
+            panel.0.end_arrow();
+        } else if let Some(idx) = cell
+            && panel.0.drag_arrow.is_some_and(|(_, to)| to != idx)
+        {
+            panel.0.drag_arrow_to(idx);
         }
     }
+}
 
-    // Keyboard: n new puzzle, s show solution, f flip board.
+/// n new puzzle, s show solution, f flip board.
+fn keyboard_input(mut panel: ResMut<PanelRes>, keys: Res<ButtonInput<KeyCode>>) {
     if keys.just_pressed(KeyCode::KeyN) {
-        panel.0.fetch_puzzle();
+        panel.0.request_puzzle();
     }
     if keys.just_pressed(KeyCode::KeyS) {
         panel.0.show_solution();
     }
     if keys.just_pressed(KeyCode::KeyF) {
-        panel.0.flip_view = !panel.0.flip_view;
+        panel.0.toggle_flip();
     }
 }
 
-fn ui_interactions(
+/// Click handling and the hover look: the primary button is an accent slab
+/// that lightens; secondary buttons invert to white.
+fn buttons(
     mut panel: ResMut<PanelRes>,
-    cursor: Res<Cursor>,
-    windows: Query<&Window>,
+    mut armed: ResMut<ArmedButton>,
     mouse: Res<ButtonInput<MouseButton>>,
-    mut interactions: Query<
-        (&Interaction, Option<&BtnNew>, Option<&BtnSolution>),
-        Changed<Interaction>,
-    >,
+    mut buttons: Query<(Entity, &Action, &RelativeCursorPosition, &mut BackgroundColor, &mut BorderColor, &Children)>,
+    mut labels: Query<&mut TextColor>,
 ) {
-    for (interaction, new_btn, solution_btn) in interactions.iter_mut() {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        if new_btn.is_some() && panel.0.phase != Phase::Loading {
-            panel.0.fetch_puzzle();
-        }
-        if solution_btn.is_some() {
-            panel.0.show_solution();
-        }
-    }
-
-    // ELO slider: press or hold anywhere on the track to set the value.
-    let win_w = windows.single().map(|w| w.width()).unwrap_or(470.0);
-    let track_x0 = (win_w - SLIDER_W) / 2.0;
-    let track_x1 = track_x0 + SLIDER_W;
-    let near_track = cursor.inside
-        && cursor.x >= track_x0 - 8.0
-        && cursor.x <= track_x1 + 8.0
-        && (cursor.y - SLIDER_Y).abs() <= 14.0;
-    if mouse.pressed(MouseButton::Left) && near_track {
-        let frac = ((cursor.x - track_x0) / SLIDER_W).clamp(0.0, 1.0);
-        let raw = ELO_MIN as f32 + frac * (ELO_MAX - ELO_MIN) as f32;
-        let elo = ((raw / ELO_STEP as f32).round() as i64 * ELO_STEP).clamp(ELO_MIN, ELO_MAX);
-        panel.0.set_elo(elo);
-    }
-}
-
-fn timers(time: Res<Time>, mut panel: ResMut<PanelRes>) {
-    let dt = time.delta_secs() * 1000.0;
-    let s = &mut panel.0;
-
-    if s.reply_timer > 0.0 {
-        s.reply_timer -= dt;
-        if s.reply_timer <= 0.0 {
-            s.reply_timer = 0.0;
-            s.play_reply();
-        }
-    }
-    if s.solution_timer > 0.0 {
-        s.solution_timer -= dt;
-        if s.solution_timer <= 0.0 {
-            s.solution_timer = 0.0;
-            s.play_solution_step();
-        }
-    }
-    if s.flash_timer > 0.0 {
-        s.flash_timer -= dt;
-        if s.flash_timer <= 0.0 {
-            s.flash_timer = 0.0;
-            s.wrong_flash = None;
-        }
-    }
-    if let Some(arrow) = s.auto_arrow.as_mut() {
-        arrow.age_ms += dt;
-        // Show 900ms, fade 500ms.
-        arrow.alpha = if arrow.age_ms < 900.0 {
-            1.0
-        } else {
-            (1.0 - (arrow.age_ms - 900.0) / 500.0).max(0.0)
+    for (entity, action, cursor, mut bg, mut border, children) in &mut buttons {
+        let enabled = match action {
+            Action::NewPuzzle => true,
+            Action::ShowSolution => panel.0.can_show_solution(),
         };
-        if arrow.alpha <= 0.0 {
-            s.auto_arrow = None;
+        let hovered = enabled && cursor.cursor_over();
+        if hovered && mouse.just_pressed(MouseButton::Left) {
+            armed.0 = Some(entity);
         }
-    }
-}
+        if mouse.just_released(MouseButton::Left) && armed.0 == Some(entity) {
+            armed.0 = None;
+            if hovered {
+                match action {
+                    Action::NewPuzzle => panel.0.request_puzzle(),
+                    Action::ShowSolution => panel.0.show_solution(),
+                }
+            }
+        }
 
-fn update_ui(
-    mut texts: Query<(
-        &mut Text,
-        Option<&StatusText>,
-        Option<&EloValueText>,
-        Option<&SolvedText>,
-    )>,
-    mut slider: Query<(&mut Node, Option<&SliderFill>, Option<&SliderKnob>)>,
-    mut status_colors: Query<&mut TextColor, With<StatusText>>,
-    panel: Res<PanelRes>,
-) {
-    let status = panel.0.status.clone();
-    let elo = panel.0.target_elo;
-    let solved = panel.0.solved;
-
-    for (mut text, status_m, elo_m, solved_m) in texts.iter_mut() {
-        if status_m.is_some() {
-            text.0 = status.clone();
-        }
-        if elo_m.is_some() {
-            text.0 = elo.to_string();
-        }
-        if solved_m.is_some() {
-            text.0 = if solved > 0 { format!("{solved} solved") } else { String::new() };
-        }
-    }
-
-    let frac = (elo - ELO_MIN) as f32 / (ELO_MAX - ELO_MIN) as f32;
-    for (mut node, fill, knob) in slider.iter_mut() {
-        if fill.is_some() {
-            node.width = Val::Percent(frac * 100.0);
-        }
-        if knob.is_some() {
-            node.left = Val::Px(frac * SLIDER_W - 7.0);
-        }
-    }
-
-    for mut color in status_colors.iter_mut() {
-        color.0 = if panel.0.phase == Phase::Won {
-            Color::srgb(0.063, 0.72, 0.505) // #10b981
-        } else {
-            Color::srgb(0.90, 0.91, 0.94)
+        let (fill, edge, ink) = match (action.primary(), enabled, hovered) {
+            (true, _, false) => (theme::ACCENT, theme::ACCENT, theme::BG),
+            (true, _, true) => (theme::ACCENT_HOVER, theme::ACCENT_HOVER, theme::BG),
+            (false, false, _) => (theme::CONTROL, theme::LINE_STRONG, theme::FAINT),
+            (false, true, false) => (theme::CONTROL, theme::LINE_STRONG, theme::TEXT),
+            (false, true, true) => (theme::INVERT, theme::INVERT, theme::BG),
         };
-    }
-}
-
-/// Keep the world-space board where the layout says, at the right size —
-/// every frame, so any window size just works.
-fn position_board(
-    layout: Res<BoardLayout>,
-    mut sprite: Query<(&mut Transform, &mut Sprite), With<BoardSprite>>,
-    windows: Query<&Window>,
-) {
-    let Ok(window) = windows.single() else { return };
-    let win_h = window.height();
-    let Ok((mut transform, mut sprite)) = sprite.single_mut() else { return };
-    // World y is up-positive; screen top-down board center:
-    let center_y_screen = layout.top + layout.size / 2.0;
-    transform.translation.y = win_h / 2.0 - center_y_screen;
-    transform.translation.x = layout.x0 + layout.size / 2.0 - window.width() / 2.0;
-    sprite.custom_size = Some(Vec2::splat(layout.size));
-}
-
-fn repaint_board(
-    panel: Res<PanelRes>,
-    pieces: Res<PieceImages>,
-    layout: Res<BoardLayout>,
-    mut current: ResMut<CurrentCell>,
-    mut handle: ResMut<BoardImageHandle>,
-    mut images: ResMut<Assets<Image>>,
-    mut sprite: Query<&mut Sprite, With<BoardSprite>>,
-    mut last: Local<Vec<u8>>,
-) {
-    let cell = layout.paint_cell;
-    // Paint size changed (window resized or moved between displays): rebuild
-    // the texture at the new resolution.
-    if cell != current.0 {
-        let tex = cell * 8;
-        let image = Image::new(
-            Extent3d { width: tex, height: tex, depth_or_array_layers: 1 },
-            TextureDimension::D2,
-            vec![0; (tex * tex * 4) as usize],
-            TextureFormat::Rgba8UnormSrgb,
-            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-        );
-        let new_handle = images.add(image);
-        if let Ok(mut sp) = sprite.single_mut() {
-            sp.image = new_handle.clone();
+        bg.set_if_neq(BackgroundColor(ui(fill)));
+        border.set_if_neq(BorderColor::all(ui(edge)));
+        for child in children {
+            if let Ok(mut color) = labels.get_mut(*child) {
+                color.set_if_neq(TextColor(ui(ink)));
+            }
         }
-        handle.0 = new_handle;
-        last.clear();
-        current.0 = cell;
     }
-    let data = paint_board(&panel.0, &pieces.0, cell);
-    if data == *last {
+}
+
+/// Press or drag anywhere on the slider; the puzzle is fetched on release.
+fn slider(
+    mut panel: ResMut<PanelRes>,
+    mut drag: ResMut<SliderDrag>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    slider: Query<&RelativeCursorPosition, With<Slider>>,
+) {
+    let Ok(cursor) = slider.single() else { return };
+    if mouse.just_pressed(MouseButton::Left) && cursor.cursor_over() {
+        drag.0 = Some(panel.0.target_elo);
+    }
+    let Some(preview) = drag.0 else { return };
+    if !mouse.pressed(MouseButton::Left) {
+        drag.0 = None;
+        panel.0.set_elo(preview);
         return;
     }
-    *last = data.clone();
-    if let Some(mut image) = images.get_mut(&handle.0) {
-        match &mut image.data {
-            Some(buf) => *buf = data,
-            None => image.data = Some(data),
+    if let Some(n) = cursor.normalized {
+        let frac = (n.x + 0.5).clamp(0.0, 1.0);
+        let raw = ELO_MIN as f32 + frac * (ELO_MAX - ELO_MIN) as f32;
+        drag.0 = Some(((raw / ELO_STEP as f32).round() as i64 * ELO_STEP).clamp(ELO_MIN, ELO_MAX));
+    }
+}
+
+fn tick(time: Res<Time>, mut panel: ResMut<PanelRes>) {
+    panel.0.tick((time.delta_secs() * 1000.0).min(MAX_TICK_MS));
+}
+
+/// UI or board entities whose change still has to work through layout,
+/// text shaping or rendering.
+type Unsettled = Or<(Changed<ComputedNode>, Changed<Node>, Changed<Text>, Changed<Transform>, Changed<Sprite>)>;
+
+/// Requests the next frame while anything is in motion: countdowns, fades, a
+/// running fetch, the font loading, input, and any change still settling
+/// (a resize takes several frames to go from layout to board repaint to
+/// screen). Once a frame changes nothing, the event loop sleeps.
+#[allow(clippy::too_many_arguments)]
+fn keep_awake(
+    panel: Res<PanelRes>,
+    job: Res<FetchJob>,
+    geom: Res<BoardGeom>,
+    font: Res<UiFont>,
+    assets: Res<AssetServer>,
+    unsettled: Query<(), Unsettled>,
+    mut images: MessageReader<AssetEvent<Image>>,
+    mut cursor: MessageReader<CursorMoved>,
+    mut left: MessageReader<CursorLeft>,
+    mut clicks: MessageReader<MouseButtonInput>,
+    mut keys: MessageReader<KeyboardInput>,
+    mut resized: MessageReader<WindowResized>,
+    mut rescaled: MessageReader<WindowScaleFactorChanged>,
+    mut trailing: Local<u8>,
+    mut winit: ResMut<WinitSettings>,
+) {
+    let input = cursor.read().count()
+        + left.read().count()
+        + clicks.read().count()
+        + keys.read().count()
+        + resized.read().count()
+        + rescaled.read().count()
+        > 0;
+    let settling = geom.is_changed() || !unsettled.is_empty() || images.read().count() > 0;
+    let busy = panel.0.is_animating()
+        || panel.0.fetch_pending()
+        || job.0.is_some()
+        || !assets.is_loaded_with_dependencies(font.0.id());
+    if input || settling || busy {
+        *trailing = TRAILING_FRAMES;
+    }
+    // Awake means Continuous rather than RequestRedraw: on Wayland a redraw
+    // request is paced by frame callbacks and can be lost before the window
+    // is configured, leaving it black until the next input event. Switching
+    // the mode makes winit run the next update itself.
+    let mode = if *trailing > 0 {
+        *trailing -= 1;
+        UpdateMode::Continuous
+    } else {
+        UpdateMode::reactive_low_power(IDLE_WAKE)
+    };
+    if winit.focused_mode != mode {
+        winit.focused_mode = mode;
+        winit.unfocused_mode = mode;
+    }
+}
+
+/// Writes only on a real change: a plain `&mut` access through `Mut` marks
+/// the text changed and re-shapes it, even when the value is equal.
+fn set_text(mut text: Mut<Text>, value: String) {
+    if text.0 != value {
+        text.0 = value;
+    }
+}
+
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn update_ui(
+    panel: Res<PanelRes>,
+    drag: Res<SliderDrag>,
+    mut status: Query<(&mut Text, &mut TextColor, &mut TextFont), With<StatusText>>,
+    mut meta: Query<&mut Text, (With<MetaText>, Without<StatusText>)>,
+    mut elo_text: Query<&mut Text, (With<EloValueText>, Without<StatusText>, Without<MetaText>)>,
+    mut solved_text: Query<&mut Text, (With<SolvedText>, Without<StatusText>, Without<MetaText>, Without<EloValueText>)>,
+    mut fill: Query<(&mut Node, &mut BackgroundColor), (With<SliderFill>, Without<SliderKnob>)>,
+    mut knob: Query<&mut Node, (With<SliderKnob>, Without<SliderFill>)>,
+) {
+    let s = &panel.0;
+    if let Ok((text, mut color, mut font)) = status.single_mut() {
+        set_text(text, s.status.clone());
+        let (ink, weight) = match s.tone {
+            Tone::Normal => (theme::TEXT, FontWeight::NORMAL),
+            Tone::Muted => (theme::MUTED, FontWeight::NORMAL),
+            Tone::Good => (theme::TEXT, FontWeight::BOLD),
+            Tone::Bad => (theme::ACCENT, FontWeight::BOLD),
+        };
+        color.set_if_neq(TextColor(ui(ink)));
+        if font.weight != weight {
+            font.weight = weight;
         }
     }
+    if let Ok(text) = meta.single_mut() {
+        let line = match (&s.puzzle, s.phase) {
+            (Some(p), phase) if phase != Phase::Loading => {
+                let mut parts = vec![format!("#{}", p.id), p.rating.to_string()];
+                parts.extend(p.themes.first().cloned());
+                parts.join(" · ")
+            }
+            _ => String::new(),
+        };
+        set_text(text, line);
+    }
+
+    let elo = drag.0.unwrap_or(s.target_elo);
+    if let Ok(text) = elo_text.single_mut() {
+        set_text(text, elo.to_string());
+    }
+    if let Ok(text) = solved_text.single_mut() {
+        set_text(text, format!("{} SOLVED", s.solved));
+    }
+
+    // The fill turns accent while the slider is being dragged.
+    let frac = (elo - ELO_MIN) as f32 / (ELO_MAX - ELO_MIN) as f32;
+    if let Ok((mut node, mut bg)) = fill.single_mut() {
+        let width = Val::Percent(frac * 100.0);
+        if node.width != width {
+            node.width = width;
+        }
+        bg.set_if_neq(BackgroundColor(ui(if drag.0.is_some() { theme::ACCENT } else { theme::TEXT })));
+    }
+    if let Ok(mut node) = knob.single_mut() {
+        // The 10px knob slides from flush-left to flush-right of the track.
+        let left = Val::Percent(frac * 100.0);
+        if node.left != left {
+            node.left = left;
+            node.margin.left = Val::Px(-10.0 * frac);
+        }
+    }
+}
+
+/// Repaints the board texture, only when what it shows (or its size) changed.
+#[allow(clippy::too_many_arguments)]
+fn repaint_board(
+    panel: Res<PanelRes>,
+    art: Res<PieceSource>,
+    geom: Res<BoardGeom>,
+    mut images: ResMut<Assets<Image>>,
+    mut board: Query<&mut Sprite, With<BoardSprite>>,
+    mut sprites: Local<Option<PieceSprites>>,
+    mut painted: Local<Option<(BoardView, u32, f32)>>,
+) {
+    if geom.cell == 0 {
+        return;
+    }
+    let Ok(mut sprite) = board.single_mut() else { return };
+    let view = BoardView::of(&panel.0);
+    // Placement alone doesn't change the picture: key on cell size and scale.
+    let key = (view, geom.cell, geom.scale);
+    if painted.as_ref() == Some(&key) {
+        return;
+    }
+
+    let size = piece_size(geom.cell);
+    if sprites.as_ref().is_none_or(|s| s.size != size) {
+        *sprites = Some(art.0.rasterize(size));
+    }
+    let ring = (RING * geom.scale).round().max(1.0) as u32;
+    let data = paint_board(&key.0, sprites.as_ref().unwrap(), geom.cell, ring);
+
+    let texels = geom.texels();
+    if let Some(mut image) = images.get_mut(&sprite.image)
+        && image.width() == texels
+    {
+        image.data = Some(data);
+    } else {
+        // Size changed (window resized or moved between displays).
+        let mut image = board_image(texels);
+        image.data = Some(data);
+        sprite.image = images.add(image);
+    }
+    *painted = Some(key);
 }
