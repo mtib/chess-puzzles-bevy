@@ -115,7 +115,11 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "chess puzzles".into(),
-                        resolution: (400u32, 600u32).into(),
+                        // Wayland app_id / X11 WM_CLASS, for window rules.
+                        name: Some("chess-puzzles".into()),
+                        // Preferred size in logical px (the scale factor is 1
+                        // until the window exists, so these come out logical).
+                        resolution: (340u32, 484u32).into(),
                         // Room for the controls plus a board of MIN_CELL squares.
                         resize_constraints: WindowResizeConstraints {
                             min_width: 8.0 * MIN_CELL + 2.0 * (16.0 + BOARD_MARGIN),
