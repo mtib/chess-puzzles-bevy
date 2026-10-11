@@ -8,9 +8,12 @@ monochrome, terminal-styled board.
 
 ## Features
 
-- **ELO slider** (600–2500, step 50): puzzles are served from a local cache,
-  picking the one closest to your target rating while avoiding the ~80 most
-  recently served.
+- **Adaptive difficulty**: a hidden target ELO (600–2500) follows your
+  results. Each puzzle settles once: a clean solve +8, a solve with wrong
+  tries −4, showing the solution or skipping mid-puzzle −12. It settles where
+  you solve about two in three puzzles cleanly. A puzzle's rating is shown
+  only after it's settled. Puzzles are served from a local cache, picking the
+  one closest to the target while avoiding the ~80 most recently served.
 - **Offline cache** seeded from the
   [Lichess puzzle database](https://database.lichess.org/) — popular puzzles
   bucketed across the whole rating range. `pick.sh` falls back to a live
@@ -19,8 +22,7 @@ monochrome, terminal-styled board.
   generator — the solution is the only judge). Opponent replies auto-play
   after 650ms; "Show solution" walks the line at 650ms a move; wrong attempts
   flash the target square; promotions accepted on the first four characters.
-  Puzzles are fetched off the main thread, and the slider only fetches when
-  released.
+  Puzzles are fetched off the main thread.
 - **Pixel-exact board**, CPU-painted to a texture with one texel per physical
   pixel at any window size and display scale: whole-pixel squares, 1px dashed
   outlines, and pieces rendered from SVG at their exact size (no resampling).

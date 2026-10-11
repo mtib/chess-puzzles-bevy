@@ -23,8 +23,8 @@ use bevy::winit::{UpdateMode, WinitSettings};
 use model::PuzzleRecord;
 use paint::{paint_board, piece_size, BoardView};
 use pieces::{PieceArt, PieceSprites};
-use state::{PanelState, Phase, Tone, ELO_MAX, ELO_MIN, ELO_STEP};
-use std::time::Duration;
+use state::{PanelState, Phase, Tone};
+use std::time::{Duration, Instant};
 use theme::ui;
 
 /// Logical px per square, before the display scale. The board shrinks
@@ -35,19 +35,19 @@ const MAX_CELL: f32 = 96.0;
 const FLOOR_CELL: f32 = 4.0;
 /// Logical px kept free around the board inside its slot.
 const BOARD_MARGIN: f32 = 8.0;
-const SLIDER_W: f32 = 330.0;
-/// Logical height of everything around the board (title, slider, status,
-/// buttons, padding): about 210 px in the running layout, plus slack.
-const CONTROLS_H: f32 = 260.0;
+/// Logical height of everything around the board (title, status, buttons,
+/// padding, board margins): about 218 px measured at 1.6x, plus slack.
+const CONTROLS_H: f32 = 240.0;
 /// Selection ring width, logical px.
 const RING: f32 = 2.0;
 /// Longest timer step per frame. The first frame after an idle wait reports
 /// the whole wait as its delta; unclamped, a reply scheduled by that frame's
 /// click would play instantly.
 const MAX_TICK_MS: f32 = 50.0;
-/// Frames rendered after the last input, so the pipelined renderer shows its
-/// result before the loop goes back to sleep.
-const TRAILING_FRAMES: u8 = 2;
+/// How long to keep rendering after the last activity. A couple of frames
+/// is not enough: after a resize the rebuilt swapchain can drop its first
+/// presents, and the window stays black until the next input.
+const SETTLE_TAIL: Duration = Duration::from_millis(300);
 /// Wake-up interval while idle, as a safety net; input wakes it at once.
 const IDLE_WAKE: Duration = Duration::from_secs(60);
 
@@ -78,10 +78,6 @@ impl BoardGeom {
     }
 }
 
-/// The ELO the slider shows while being dragged; committed on release.
-#[derive(Resource, Default)]
-struct SliderDrag(Option<i64>);
-
 #[derive(Resource)]
 struct UiFont(Handle<Font>);
 
@@ -94,15 +90,7 @@ struct StatusText;
 #[derive(Component)]
 struct MetaText;
 #[derive(Component)]
-struct EloValueText;
-#[derive(Component)]
 struct SolvedText;
-#[derive(Component)]
-struct Slider;
-#[derive(Component)]
-struct SliderFill;
-#[derive(Component)]
-struct SliderKnob;
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -148,7 +136,6 @@ fn main() {
         .insert_resource(PieceSource(PieceArt::load(&paths::assets_dir().join("pieces"))))
         .init_resource::<FetchJob>()
         .init_resource::<BoardGeom>()
-        .init_resource::<SliderDrag>()
         .init_resource::<ArmedButton>()
         .add_systems(Startup, setup)
         .add_systems(
@@ -159,7 +146,6 @@ fn main() {
                 board_input,
                 keyboard_input,
                 buttons,
-                slider,
                 tick,
                 update_ui,
                 repaint_board,
@@ -204,52 +190,6 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, asset_server
             // Lowercase wordmark, solved count as a muted label beneath.
             col.spawn((text(&font, "chess puzzles", 24.0, FontWeight::BOLD, theme::HEADING), LetterSpacing::Px(-1.2)));
             col.spawn((label(&font, "", theme::MUTED), SolvedText, Node { margin: UiRect::top(Val::Px(4.0)), ..default() }));
-
-            // ELO: label + value, then the slider.
-            col.spawn(Node {
-                column_gap: Val::Px(10.0),
-                margin: UiRect::top(Val::Px(14.0)),
-                align_items: AlignItems::Baseline,
-                ..default()
-            })
-            .with_children(|row| {
-                row.spawn(label(&font, "PUZZLE ELO", theme::MUTED));
-                row.spawn((text(&font, "", 13.0, FontWeight::BOLD, theme::TEXT), EloValueText));
-            });
-            // The slider node is a 20px hit area; the 4px track sits centred in it.
-            col.spawn((
-                Node {
-                    width: Val::Px(SLIDER_W),
-                    max_width: Val::Percent(100.0),
-                    height: Val::Px(20.0),
-                    margin: UiRect::top(Val::Px(4.0)),
-                    ..default()
-                },
-                RelativeCursorPosition::default(),
-                Slider,
-            ))
-            .with_children(|track| {
-                let bar = |width: Val| Node {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(8.0),
-                    width,
-                    height: Val::Px(4.0),
-                    ..default()
-                };
-                track.spawn((bar(Val::Percent(100.0)), BackgroundColor(ui(theme::LINE_STRONG))));
-                track.spawn((bar(Val::Percent(0.0)), BackgroundColor(ui(theme::TEXT)), SliderFill));
-                track.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        top: Val::Px(5.0),
-                        width: Val::Px(10.0),
-                        height: Val::Px(10.0),
-                        ..default()
-                    },
-                    BackgroundColor(ui(theme::INVERT)),
-                    SliderKnob,
-                ));
-            });
 
             // Free space for the board; layout_board places the sprite in it.
             col.spawn((
@@ -347,7 +287,7 @@ fn drive_fetch(mut panel: ResMut<PanelRes>, mut job: ResMut<FetchJob>) {
         && let Some(record) = check_ready(task)
     {
         job.0 = None;
-        // A newer request (e.g. the ELO changed mid-fetch) supersedes this result.
+        // A newer request (e.g. "new puzzle" pressed mid-fetch) supersedes this result.
         if !panel.0.fetch_pending() {
             panel.0.puzzle_loaded(record);
         }
@@ -454,30 +394,6 @@ fn buttons(
     }
 }
 
-/// Press or drag anywhere on the slider; the puzzle is fetched on release.
-fn slider(
-    mut panel: ResMut<PanelRes>,
-    mut drag: ResMut<SliderDrag>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    slider: Query<&RelativeCursorPosition, With<Slider>>,
-) {
-    let Ok(cursor) = slider.single() else { return };
-    if mouse.just_pressed(MouseButton::Left) && cursor.cursor_over() {
-        drag.0 = Some(panel.0.target_elo);
-    }
-    let Some(preview) = drag.0 else { return };
-    if !mouse.pressed(MouseButton::Left) {
-        drag.0 = None;
-        panel.0.set_elo(preview);
-        return;
-    }
-    if let Some(n) = cursor.normalized {
-        let frac = (n.x + 0.5).clamp(0.0, 1.0);
-        let raw = ELO_MIN as f32 + frac * (ELO_MAX - ELO_MIN) as f32;
-        drag.0 = Some(((raw / ELO_STEP as f32).round() as i64 * ELO_STEP).clamp(ELO_MIN, ELO_MAX));
-    }
-}
-
 fn tick(time: Res<Time>, mut panel: ResMut<PanelRes>) {
     panel.0.tick((time.delta_secs() * 1000.0).min(MAX_TICK_MS));
 }
@@ -505,7 +421,7 @@ fn keep_awake(
     mut keys: MessageReader<KeyboardInput>,
     mut resized: MessageReader<WindowResized>,
     mut rescaled: MessageReader<WindowScaleFactorChanged>,
-    mut trailing: Local<u8>,
+    mut last_active: Local<Option<Instant>>,
     mut winit: ResMut<WinitSettings>,
 ) {
     let input = cursor.read().count()
@@ -521,19 +437,25 @@ fn keep_awake(
         || job.0.is_some()
         || !assets.is_loaded_with_dependencies(font.0.id());
     if input || settling || busy {
-        *trailing = TRAILING_FRAMES;
+        *last_active = Some(Instant::now());
     }
     // Awake means Continuous rather than RequestRedraw: on Wayland a redraw
     // request is paced by frame callbacks and can be lost before the window
     // is configured, leaving it black until the next input event. Switching
     // the mode makes winit run the next update itself.
-    let mode = if *trailing > 0 {
-        *trailing -= 1;
+    let mode = if last_active.is_some_and(|t| t.elapsed() < SETTLE_TAIL) {
         UpdateMode::Continuous
     } else {
         UpdateMode::reactive_low_power(IDLE_WAKE)
     };
     if winit.focused_mode != mode {
+        debug!(
+            "{} (input {input}, settling {settling}, busy {busy}, board {}px at {},{})",
+            if mode == UpdateMode::Continuous { "awake" } else { "asleep" },
+            geom.cell * 8,
+            geom.left,
+            geom.top,
+        );
         winit.focused_mode = mode;
         winit.unfocused_mode = mode;
     }
@@ -550,13 +472,9 @@ fn set_text(mut text: Mut<Text>, value: String) {
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn update_ui(
     panel: Res<PanelRes>,
-    drag: Res<SliderDrag>,
     mut status: Query<(&mut Text, &mut TextColor, &mut TextFont), With<StatusText>>,
     mut meta: Query<&mut Text, (With<MetaText>, Without<StatusText>)>,
-    mut elo_text: Query<&mut Text, (With<EloValueText>, Without<StatusText>, Without<MetaText>)>,
-    mut solved_text: Query<&mut Text, (With<SolvedText>, Without<StatusText>, Without<MetaText>, Without<EloValueText>)>,
-    mut fill: Query<(&mut Node, &mut BackgroundColor), (With<SliderFill>, Without<SliderKnob>)>,
-    mut knob: Query<&mut Node, (With<SliderKnob>, Without<SliderFill>)>,
+    mut solved_text: Query<&mut Text, (With<SolvedText>, Without<StatusText>, Without<MetaText>)>,
 ) {
     let s = &panel.0;
     if let Ok((text, mut color, mut font)) = status.single_mut() {
@@ -573,9 +491,12 @@ fn update_ui(
         }
     }
     if let Ok(text) = meta.single_mut() {
+        // The puzzle's rating would give the hidden target away: it shows
+        // only once the puzzle is settled.
         let line = match (&s.puzzle, s.phase) {
             (Some(p), phase) if phase != Phase::Loading => {
-                let mut parts = vec![format!("#{}", p.id), p.rating.to_string()];
+                let mut parts = vec![format!("#{}", p.id)];
+                parts.extend(s.change.map(|_| p.rating.to_string()));
                 parts.extend(p.themes.first().cloned());
                 parts.join(" · ")
             }
@@ -584,30 +505,8 @@ fn update_ui(
         set_text(text, line);
     }
 
-    let elo = drag.0.unwrap_or(s.target_elo);
-    if let Ok(text) = elo_text.single_mut() {
-        set_text(text, elo.to_string());
-    }
     if let Ok(text) = solved_text.single_mut() {
         set_text(text, format!("{} SOLVED", s.solved));
-    }
-
-    // The fill turns accent while the slider is being dragged.
-    let frac = (elo - ELO_MIN) as f32 / (ELO_MAX - ELO_MIN) as f32;
-    if let Ok((mut node, mut bg)) = fill.single_mut() {
-        let width = Val::Percent(frac * 100.0);
-        if node.width != width {
-            node.width = width;
-        }
-        bg.set_if_neq(BackgroundColor(ui(if drag.0.is_some() { theme::ACCENT } else { theme::TEXT })));
-    }
-    if let Ok(mut node) = knob.single_mut() {
-        // The 10px knob slides from flush-left to flush-right of the track.
-        let left = Val::Percent(frac * 100.0);
-        if node.left != left {
-            node.left = left;
-            node.margin.left = Val::Px(-10.0 * frac);
-        }
     }
 }
 

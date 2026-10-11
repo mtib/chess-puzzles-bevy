@@ -2,6 +2,10 @@
 //! input judged against the solution list, auto-played opponent replies,
 //! solution playback, user arrows, persistence.
 //!
+//! The target ELO is hidden and adapts: every puzzle settles exactly once —
+//! a clean solve raises it, a solve with mistakes lowers it, revealing the
+//! solution (or skipping) lowers it more.
+//!
 //! Pending moves live inside the phase that owns them (`Replying`,
 //! `Revealing`), so leaving a phase cancels its countdown. Puzzle fetching is
 //! only *requested* here; main.rs runs the picker off the main thread and
@@ -15,8 +19,12 @@ use std::process::Command;
 
 pub const ELO_MIN: i64 = 600;
 pub const ELO_MAX: i64 = 2500;
-pub const ELO_STEP: i64 = 50;
 const DEFAULT_ELO: i64 = 1500;
+/// Target changes per settled puzzle. They balance out where about two in
+/// three puzzles are solved cleanly.
+const CLEAN_GAIN: i64 = 8;
+const MISTAKES_LOSS: i64 = 4;
+const REVEAL_LOSS: i64 = 12;
 const STATE_FILE: &str = ".local/state/omarchy/settings/chesspuzzles-bevy.json";
 
 const REPLY_DELAY_MS: f32 = 650.0;
@@ -51,6 +59,34 @@ pub enum Tone {
     Bad,
 }
 
+/// How a puzzle ended, for the target ELO.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outcome {
+    Clean,
+    Mistakes,
+    /// Solution shown, or skipped mid-puzzle.
+    Revealed,
+}
+
+impl Outcome {
+    fn delta(self) -> i64 {
+        match self {
+            Outcome::Clean => CLEAN_GAIN,
+            Outcome::Mistakes => -MISTAKES_LOSS,
+            Outcome::Revealed => -REVEAL_LOSS,
+        }
+    }
+}
+
+/// "+8", "−4", "±0" (the last when the target is pinned at a bound).
+pub fn format_change(delta: i64) -> String {
+    match delta {
+        0 => "±0".into(),
+        d if d > 0 => format!("+{d}"),
+        d => format!("−{}", -d),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Arrow {
     pub from: usize,
@@ -76,8 +112,11 @@ pub struct PanelState {
     pub phase: Phase,
     pub status: String,
     pub tone: Tone,
+    /// Hidden: drives puzzle selection, never shown.
     pub target_elo: i64,
     pub solved: u32,
+    /// The target change this puzzle settled with; `None` while unsettled.
+    pub change: Option<i64>,
     fetch_requested: bool,
     fetch_retries: u32,
 }
@@ -108,6 +147,7 @@ impl PanelState {
             tone: Tone::Muted,
             target_elo,
             solved,
+            change: None,
             fetch_requested: false,
             fetch_retries: 0,
         };
@@ -131,13 +171,37 @@ impl PanelState {
 
     // ------------------------------------------------------------- fetching
 
-    /// Asks for a new puzzle at the target ELO. Cancels whatever was going on.
+    /// Asks for a new puzzle at the target ELO. Cancels whatever was going
+    /// on; leaving a puzzle unfinished counts as revealing it.
     pub fn request_puzzle(&mut self) {
+        let skipped = self.in_puzzle().then(|| self.settle(Outcome::Revealed));
         self.fetch_requested = true;
         self.phase = Phase::Loading;
         self.selected = None;
         self.drag_arrow = None;
-        self.set_status("loading puzzle…", Tone::Muted);
+        match skipped {
+            Some(delta) => self.set_status(format!("skipped {} · loading puzzle…", format_change(delta)), Tone::Muted),
+            None => self.set_status("loading puzzle…", Tone::Muted),
+        }
+    }
+
+    /// A puzzle is on the board and its outcome isn't decided yet.
+    fn in_puzzle(&self) -> bool {
+        matches!(self.phase, Phase::Play | Phase::Replying { .. }) && self.change.is_none()
+    }
+
+    /// Applies the outcome to the target ELO, once per puzzle. Returns the
+    /// change actually applied (clamped at the bounds).
+    fn settle(&mut self, outcome: Outcome) -> i64 {
+        if let Some(delta) = self.change {
+            return delta;
+        }
+        let before = self.target_elo;
+        self.target_elo = (before + outcome.delta()).clamp(ELO_MIN, ELO_MAX);
+        let delta = self.target_elo - before;
+        self.change = Some(delta);
+        save_state(self);
+        delta
     }
 
     /// True while a request is waiting to be picked up.
@@ -172,6 +236,7 @@ impl PanelState {
         self.drag_arrow = None;
         self.auto_arrow = None;
         self.phase = Phase::Play;
+        self.change = None;
         self.fetch_retries = 0;
         self.set_status(format!("{} to play · find the best move", side_name(turn)), Tone::Normal);
     }
@@ -247,8 +312,8 @@ impl PanelState {
         self.play(&mv);
         if self.step >= self.solution().len() {
             self.phase = Phase::Revealed;
-            let id = self.puzzle.as_ref().map(|p| p.id.as_str()).unwrap_or_default();
-            self.set_status(format!("REVEALED · PUZZLE {id}"), Tone::Muted);
+            let change = format_change(self.change.unwrap_or_default());
+            self.set_status(format!("REVEALED · {change}"), Tone::Muted);
         } else {
             self.phase = Phase::Revealing { in_ms: SOLUTION_STEP_MS };
         }
@@ -257,11 +322,12 @@ impl PanelState {
     fn win(&mut self) {
         self.phase = Phase::Won;
         self.solved += 1;
-        save_state(self);
+        let outcome = if self.tries == 0 { Outcome::Clean } else { Outcome::Mistakes };
+        let change = format_change(self.settle(outcome));
         let status = match self.tries {
-            0 => "SOLVED · CLEAN".to_string(),
-            1 => "SOLVED · 1 WRONG TRY".to_string(),
-            n => format!("SOLVED · {n} WRONG TRIES"),
+            0 => format!("SOLVED · CLEAN · {change}"),
+            1 => format!("SOLVED · 1 WRONG TRY · {change}"),
+            n => format!("SOLVED · {n} WRONG TRIES · {change}"),
         };
         self.set_status(status, Tone::Good);
     }
@@ -278,8 +344,9 @@ impl PanelState {
             return;
         }
         self.selected = None;
+        let change = format_change(self.settle(Outcome::Revealed));
         self.phase = Phase::Revealing { in_ms: SOLUTION_STEP_MS };
-        self.set_status("SOLUTION", Tone::Normal);
+        self.set_status(format!("SOLUTION · {change}"), Tone::Normal);
     }
 
     pub fn toggle_flip(&mut self) {
@@ -354,19 +421,6 @@ impl PanelState {
                 self.auto_arrow = None;
             }
         }
-    }
-
-    // ------------------------------------------------------------- settings
-
-    /// Commits a new target ELO and fetches a puzzle for it, if it changed.
-    pub fn set_elo(&mut self, elo: i64) {
-        let elo = elo.clamp(ELO_MIN, ELO_MAX);
-        if elo == self.target_elo {
-            return;
-        }
-        self.target_elo = elo;
-        save_state(self);
-        self.request_puzzle();
     }
 }
 
@@ -494,6 +548,74 @@ mod tests {
         assert!(s.is_flipped());
         s.user_color = Color::Black;
         assert!(!s.is_flipped(), "black to move, flipped back by the toggle");
+    }
+
+    fn solve(s: &mut PanelState) {
+        click(s, "d1", "d8");
+        s.tick(REPLY_DELAY_MS);
+        click(s, "d8", "h4");
+        assert_eq!(s.phase, Phase::Won);
+    }
+
+    #[test]
+    fn clean_solve_raises_target() {
+        let mut s = loaded();
+        solve(&mut s);
+        assert_eq!(s.target_elo, 1500 + CLEAN_GAIN);
+    }
+
+    #[test]
+    fn solve_with_mistakes_lowers_target() {
+        let mut s = loaded();
+        click(&mut s, "d1", "d7");
+        click(&mut s, "d1", "d6");
+        solve(&mut s);
+        assert_eq!(s.tries, 2);
+        assert_eq!(s.target_elo, 1500 - MISTAKES_LOSS, "lowered once, not per mistake");
+    }
+
+    #[test]
+    fn reveal_lowers_more_and_only_once() {
+        let mut s = loaded();
+        click(&mut s, "d1", "d7");
+        s.show_solution();
+        for _ in 0..10 {
+            s.tick(SOLUTION_STEP_MS);
+        }
+        assert_eq!(s.phase, Phase::Revealed);
+        assert_eq!(s.target_elo, 1500 - REVEAL_LOSS, "mistakes before a reveal add nothing");
+        s.request_puzzle();
+        assert_eq!(s.target_elo, 1500 - REVEAL_LOSS, "moving on from a settled puzzle is free");
+    }
+
+    #[test]
+    fn skipping_mid_puzzle_counts_as_reveal() {
+        let mut s = loaded();
+        click(&mut s, "d1", "d8"); // right move, reply pending
+        s.request_puzzle();
+        assert_eq!(s.target_elo, 1500 - REVEAL_LOSS);
+        assert_eq!(s.take_fetch_request(), Some(1500 - REVEAL_LOSS), "the next puzzle uses the new target");
+    }
+
+    #[test]
+    fn loading_and_retrying_are_free() {
+        let mut s = PanelState::with_settings(1500, 0);
+        s.request_puzzle();
+        s.take_fetch_request();
+        s.puzzle_loaded(None);
+        s.tick(RETRY_DELAY_MS);
+        assert_eq!(s.target_elo, 1500);
+    }
+
+    #[test]
+    fn target_stays_in_bounds() {
+        let mut s = PanelState::with_settings(ELO_MIN + 3, 0);
+        s.take_fetch_request();
+        s.puzzle_loaded(loaded().puzzle);
+        s.show_solution();
+        assert_eq!(s.target_elo, ELO_MIN);
+        assert_eq!(s.change, Some(-3));
+        assert_eq!(format_change(0), "±0");
     }
 
     #[test]
